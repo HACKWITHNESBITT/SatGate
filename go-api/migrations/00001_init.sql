@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS invoices (
     site_id VARCHAR(255) NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
     message TEXT NOT NULL,
     amount_sats BIGINT NOT NULL,
-    created_at VARCHAR(255) NOT NULL,
-    expires_at VARCHAR(255) NOT NULL
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS submissions (

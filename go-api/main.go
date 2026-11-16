@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -18,10 +19,11 @@ import (
 var migrationFiles embed.FS
 
 const (
-	connectionTimeout     = 10 * time.Second
-	maxOpenConnections    = 25
-	maxIdleConnections    = 5
+	connectionTimeout   = 10 * time.Second
+	maxOpenConnections  = 25
+	maxIdleConnections  = 5
 	connectionMaxLifetime = 5 * time.Minute
+	httpHost            = "0.0.0.0:8080"
 )
 
 func main() {
@@ -63,5 +65,17 @@ func run() error {
 	}
 
 	log.Print("PostgreSQL connection ready; migrations applied")
-	return nil
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	srv := &http.Server{Addr: httpHost}
+	go func() {
+		log.Fatalf("listen: %s\n", srv.ListenAndServe())
+	}()
+
+	log.Printf("HTTP health check server listening on %s", httpHost)
+	select {}
 }

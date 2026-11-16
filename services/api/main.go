@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"satgate/internal/middleware"
 
@@ -312,7 +313,7 @@ func (s *AppState) updateForm(c *gin.Context) {
 		return
 	}
 
-	form, err := s.findForm(id)
+	form, err := s.findForm(id, ownerID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -458,7 +459,7 @@ func (s *AppState) createInvoice(c *gin.Context) {
 		return
 	}
 
-	form, err := s.findForm(req.FormID)
+	form, err := s.findPublicForm(req.FormID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "form not found"})
 		return
@@ -471,8 +472,6 @@ func (s *AppState) createInvoice(c *gin.Context) {
 		"SatGate message from %s",
 		strings.TrimSpace(req.SenderName),
 	)
-
-	println(s.BlinkWalletID)
 
 	blink, err := createBlinkInvoice(
 		s.BlinkApiKey,
@@ -769,12 +768,13 @@ func (s *AppState) lightningWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func (s *AppState) findForm(id string) (*Form, error) {
+func (s *AppState) findForm(id, ownerID string) (*Form, error) {
 	log.Printf("FIND FORM: looking for id=%q", id)
 
 	var f Form
 	err := s.DB.QueryRow(
-		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ?", id,
+		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ? AND owner_id = ?",
+		id, ownerID,
 	).Scan(&f.ID, &f.Name, &f.Domain, &f.AmountSats, &f.CreatedAt)
 	if err != nil {
 		log.Printf("FIND FORM: query failed: %v", err)
@@ -789,6 +789,19 @@ func (s *AppState) findForm(id string) (*Form, error) {
 		f.Name,
 		f.AmountSats,
 	)
+
+	return &f, nil
+}
+
+// findPublicForm retrieves a form by ID for public invoice creation.
+func (s *AppState) findPublicForm(id string) (*Form, error) {
+	var f Form
+	err := s.DB.QueryRow(
+		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ?", id,
+	).Scan(&f.ID, &f.Name, &f.Domain, &f.AmountSats, &f.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
 
 	return &f, nil
 }
@@ -858,10 +871,6 @@ func validateMessagePayload(req CreateInvoiceRequest) error {
 	return nil
 }
 
-func buildDemoInvoice(invoiceID string, amountSats int64) string {
-	return fmt.Sprintf("satgate-demo-invoice:%s:%d", invoiceID, amountSats)
-}
-
 func verifySignature(headers http.Header, body, secret string) error {
 	sig := headers.Get("x-satgate-signature")
 	if sig == "" {
@@ -872,7 +881,7 @@ func verifySignature(headers http.Header, body, secret string) error {
 	mac.Write([]byte(body))
 	expected := hex.EncodeToString(mac.Sum(nil))
 
-	if expected != sig {
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) != 1 {
 		return fmt.Errorf("signature mismatch")
 	}
 	return nil

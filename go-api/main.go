@@ -1,81 +1,78 @@
 package main
 
 import (
-	"context"
 	"database/sql"
-	"embed"
-	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"time"
 
-	"github.com/pressly/goose/v3"
 	_ "github.com/lib/pq"
 )
 
-//go:embed migrations/*.sql
-var migrationFiles embed.FS
-
-const (
-	connectionTimeout   = 10 * time.Second
-	maxOpenConnections  = 25
-	maxIdleConnections  = 5
-	connectionMaxLifetime = 5 * time.Minute
-	httpHost            = "0.0.0.0:8080"
-)
-
 func main() {
-	if err := run(); err != nil {
-		log.Printf("go-api: %v", err)
-		os.Exit(1)
-	}
-}
-
-func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		return errors.New("DATABASE_URL must be set")
+		databaseURL = "postgres://postgres:postgres@localhost:5432/satgo?sslmode=disable"
 	}
 
 	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		log.Fatal(err)
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(maxOpenConnections)
-	db.SetMaxIdleConns(maxIdleConnections)
-	db.SetConnMaxLifetime(connectionMaxLifetime)
-
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
-	defer cancel()
-
-	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
 	}
+	fmt.Println("Connected to PostgreSQL database")
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("configure migrations: %w", err)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS forms (
+		id VARCHAR(255) PRIMARY KEY,
+		title VARCHAR(255) NOT NULL,
+		content TEXT NOT NULL,
+		created_at VARCHAR(255) NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal(err)
 	}
-	goose.SetBaseFS(migrationFiles)
-	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
-		return fmt.Errorf("run database migrations: %w", err)
+	fmt.Println("Created forms table")
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
+		id VARCHAR(255) PRIMARY KEY,
+		form_id VARCHAR(255) NOT NULL,
+		content TEXT NOT NULL,
+		created_at VARCHAR(255) NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal(err)
 	}
+	fmt.Println("Created messages table")
 
-	log.Print("PostgreSQL connection ready; migrations applied")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS invoices (
+		payment_hash VARCHAR(255) PRIMARY KEY,
+		payment_request TEXT NOT NULL,
+		site_id VARCHAR(255) NOT NULL,
+		message TEXT NOT NULL,
+		amount_sats BIGINT NOT NULL,
+		created_at VARCHAR(255) NOT NULL,
+		expires_at VARCHAR(255) NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Created invoices table")
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS webhook_events (
+		id VARCHAR(255) PRIMARY KEY,
+		event_type VARCHAR(255) NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		created_at VARCHAR(255) NOT NULL,
+		processed_at VARCHAR(255)
+	)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Created webhook_events table")
 
-	srv := &http.Server{Addr: httpHost}
-	go func() {
-		log.Fatalf("listen: %s\n", srv.ListenAndServe())
-	}()
-
-	log.Printf("HTTP health check server listening on %s", httpHost)
-	select {}
+	fmt.Println("All tables created successfully with PostgreSQL (lib/pq)")
 }

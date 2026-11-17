@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
+	"satgate/internal/middleware"
 
 	// "embed"
 	"encoding/hex"
@@ -24,13 +26,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-
-
 type AppState struct {
-    DB            *sql.DB
-    WebhookSecret string
-    BlinkApiKey   string
-    BlinkWalletID string
+	DB            *sql.DB
+	WebhookSecret string
+	BlinkApiKey   string
+	BlinkWalletID string
 }
 
 type Form struct {
@@ -96,8 +96,8 @@ type LightningWebhook struct {
 }
 
 type blinkInvoiceResult struct {
-    PaymentRequest string
-    PaymentHash    string
+	PaymentRequest string
+	PaymentHash    string
 }
 
 func main() {
@@ -118,18 +118,27 @@ func main() {
 	if err := seedDefaultForm(db); err != nil {
 		log.Fatalf("seed failed: %v", err)
 	}
-state := &AppState{
-    DB:            db,
-    WebhookSecret: webhookSecret,
-    BlinkApiKey:   getenv("BLINK_API_KEY", ""),
-    BlinkWalletID: getenv("BLINK_WALLET_ID", ""),
-}
+	state := &AppState{
+		DB:            db,
+		WebhookSecret: webhookSecret,
+		BlinkApiKey:   getenv("BLINK_API_KEY", ""),
+		BlinkWalletID: getenv("BLINK_WALLET_ID", ""),
+	}
 
-log.Printf(
-    "Blink configured: api_key=%t wallet_id=%t",
-    state.BlinkApiKey != "",
-    state.BlinkWalletID != "",
-)
+	log.Printf(
+		"Blink configured: api_key=%t wallet_id=%t",
+		state.BlinkApiKey != "",
+		state.BlinkWalletID != "",
+	)
+
+	appEnv := strings.ToLower(getenv("APP_ENV", "production"))
+	jwtSecret := getenv("JWT_SECRET", "")
+	allowMockTokens := appEnv == "development"
+
+	if appEnv != "development" && jwtSecret == "" {
+		log.Fatal("JWT_SECRET must be configured outside development")
+	}
+
 	r := gin.Default()
 	r.Use(cors.Default())
 
@@ -137,12 +146,15 @@ log.Printf(
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
-	r.GET("/api/forms", state.listForms)
-	r.POST("/api/forms", state.createForm)
-	r.PUT("/api/forms/:id", state.updateForm)
-	r.DELETE("/api/forms/:id", state.deleteForm)
+	protected := r.Group("/api")
+	protected.Use(middleware.Auth(jwtSecret, allowMockTokens))
 
-	r.GET("/api/messages", state.listMessages)
+	protected.GET("/forms", state.listForms)
+	protected.POST("/forms", state.createForm)
+	protected.PUT("/forms/:id", state.updateForm)
+	protected.DELETE("/forms/:id", state.deleteForm)
+
+	protected.GET("/messages", state.listMessages)
 
 	r.POST("/api/invoices", state.createInvoice)
 	r.GET("/api/invoices/:id", state.getInvoice)
@@ -170,8 +182,15 @@ log.Printf(
 }
 
 func (s *AppState) listForms(c *gin.Context) {
+	ownerID, ok := middleware.OwnerID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	rows, err := s.DB.Query(
-		"SELECT id, name, domain, amount_sats, created_at FROM forms ORDER BY created_at DESC",
+		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE owner_id = ? ORDER BY created_at DESC",
+		ownerID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -188,10 +207,22 @@ func (s *AppState) listForms(c *gin.Context) {
 		}
 		forms = append(forms, f)
 	}
+
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, forms)
 }
 
 func (s *AppState) createForm(c *gin.Context) {
+	ownerID, ok := middleware.OwnerID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	var req CreateFormRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -223,8 +254,8 @@ func (s *AppState) createForm(c *gin.Context) {
 	}
 
 	_, err := s.DB.Exec(
-		"INSERT INTO forms (id, name, domain, amount_sats, created_at) VALUES (?, ?, ?, ?, ?)",
-		form.ID, form.Name, form.Domain, form.AmountSats, form.CreatedAt,
+		"INSERT INTO forms (id, owner_id, name, domain, amount_sats, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		form.ID, ownerID, form.Name, form.Domain, form.AmountSats, form.CreatedAt,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -232,8 +263,13 @@ func (s *AppState) createForm(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, form)
 }
-
 func (s *AppState) updateForm(c *gin.Context) {
+	ownerID, ok := middleware.OwnerID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	id := c.Param("id")
 
 	var req UpdateFormRequest
@@ -259,28 +295,39 @@ func (s *AppState) updateForm(c *gin.Context) {
 	}
 
 	res, err := s.DB.Exec(
-		"UPDATE forms SET name = ?, domain = ?, amount_sats = ? WHERE id = ?",
-		req.Name, req.Domain, req.AmountSats, id,
+		"UPDATE forms SET name = ?, domain = ?, amount_sats = ? WHERE id = ? AND owner_id = ?",
+		req.Name, req.Domain, req.AmountSats, id, ownerID,
 	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	n, _ := res.RowsAffected()
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
-	form, err := s.findForm(id)
+	form, err := s.findForm(id, ownerID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
 	c.JSON(http.StatusOK, form)
 }
-
 func (s *AppState) deleteForm(c *gin.Context) {
+	ownerID, ok := middleware.OwnerID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	id := c.Param("id")
 
 	tx, err := s.DB.Begin()
@@ -291,41 +338,79 @@ func (s *AppState) deleteForm(c *gin.Context) {
 	defer tx.Rollback()
 
 	queries := []string{
-		"DELETE FROM webhook_events WHERE invoice_id IN (SELECT id FROM invoices WHERE message_id IN (SELECT id FROM messages WHERE form_id = ?))",
-		"DELETE FROM invoices WHERE message_id IN (SELECT id FROM messages WHERE form_id = ?)",
-		"DELETE FROM messages WHERE form_id = ?",
+		`DELETE FROM webhook_events
+		 WHERE invoice_id IN (
+			SELECT id FROM invoices
+			WHERE message_id IN (
+				SELECT id FROM messages
+				WHERE form_id IN (
+					SELECT id FROM forms WHERE id = ? AND owner_id = ?
+				)
+			)
+		)`,
+		`DELETE FROM invoices
+		 WHERE message_id IN (
+			SELECT id FROM messages
+			WHERE form_id IN (
+				SELECT id FROM forms WHERE id = ? AND owner_id = ?
+			)
+		)`,
+		`DELETE FROM messages
+		 WHERE form_id IN (
+			SELECT id FROM forms WHERE id = ? AND owner_id = ?
+		)`,
 	}
-	for _, q := range queries {
-		if _, err := tx.Exec(q, id); err != nil {
+
+	for _, query := range queries {
+		if _, err := tx.Exec(query, id, ownerID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 	}
 
-	res, err := tx.Exec("DELETE FROM forms WHERE id = ?", id)
+	res, err := tx.Exec(
+		"DELETE FROM forms WHERE id = ? AND owner_id = ?",
+		id, ownerID,
+	)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	n, _ := res.RowsAffected()
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	if n == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.Status(http.StatusNoContent)
 }
 
 func (s *AppState) listMessages(c *gin.Context) {
+	ownerID, ok := middleware.OwnerID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	rows, err := s.DB.Query(`
 		SELECT m.id, m.form_id, m.sender_name, m.sender_email, m.body, m.status,
 		       COALESCE(i.amount_sats, 0), m.created_at, m.paid_at
 		FROM messages m
+		JOIN forms f ON f.id = m.form_id
 		LEFT JOIN invoices i ON i.message_id = m.id
-		WHERE m.status = 'paid'
+		WHERE m.status = 'paid' AND f.owner_id = ?
 		ORDER BY m.paid_at DESC, m.created_at DESC
-	`)
+	`, ownerID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -344,74 +429,78 @@ func (s *AppState) listMessages(c *gin.Context) {
 		}
 		messages = append(messages, m)
 	}
+
+	if err := rows.Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	c.JSON(http.StatusOK, messages)
 }
+
 func (s *AppState) createInvoice(c *gin.Context) {
-   log.Printf(
-        "CREATE INVOICE: BlinkApiKey=%t BlinkWalletID=%t",
-        s.BlinkApiKey != "",
-        s.BlinkWalletID != "",
-    )
-	
+	log.Printf(
+		"CREATE INVOICE: BlinkApiKey=%t BlinkWalletID=%t",
+		s.BlinkApiKey != "",
+		s.BlinkWalletID != "",
+	)
+
 	var req CreateInvoiceRequest
 
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-        return
-    }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
-	    log.Printf("CREATE INVOICE: form_id=%q", req.FormID)
+	log.Printf("CREATE INVOICE: form_id=%q", req.FormID)
 
+	if err := validateMessagePayload(req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
-    if err := validateMessagePayload(req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-        return
-    }
+	form, err := s.findPublicForm(req.FormID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "form not found"})
+		return
+	}
 
-    form, err := s.findForm(req.FormID)
-    if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{"error": "form not found"})
-        return
-    }
+	messageID := uuid.New().String()
+	now := time.Now().UTC()
 
-    messageID := uuid.New().String()
-    now := time.Now().UTC()
+	memo := fmt.Sprintf(
+		"SatGate message from %s",
+		strings.TrimSpace(req.SenderName),
+	)
 
-    memo := fmt.Sprintf(
-        "SatGate message from %s",
-        strings.TrimSpace(req.SenderName),
-    )
+	blink, err := createBlinkInvoice(
+		s.BlinkApiKey,
+		s.BlinkWalletID,
+		form.AmountSats,
+		memo,
+	)
+	if err != nil {
+		log.Printf("Blink invoice creation failed: %v", err)
 
-println(s.BlinkWalletID)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
 
-    blink, err := createBlinkInvoice(
-        s.BlinkApiKey,
-        s.BlinkWalletID,
-        form.AmountSats,
-        memo,
-    )
-    if err != nil {
-        log.Printf("Blink invoice creation failed: %v", err)
+	invoiceID := blink.PaymentHash
+	paymentRequest := blink.PaymentRequest
+	paymentHash := blink.PaymentHash
+	expiresAt := now.Add(24 * time.Hour)
 
-        c.JSON(http.StatusInternalServerError, gin.H{
-            "error": err.Error(),
-        })
-        return
-    }
+	tx, err := s.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
 
-    invoiceID := blink.PaymentHash
-    paymentRequest := blink.PaymentRequest
-    paymentHash := blink.PaymentHash
-    expiresAt := now.Add(24 * time.Hour)
-
-    tx, err := s.DB.Begin()
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
-    defer tx.Rollback()
-
-    _, err = tx.Exec(`
+	_, err = tx.Exec(`
         INSERT INTO messages (
             id,
             form_id,
@@ -425,21 +514,21 @@ println(s.BlinkWalletID)
         )
         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, NULL)
     `,
-        messageID,
-        req.FormID,
-        strings.TrimSpace(req.SenderName),
-        strings.TrimSpace(req.SenderEmail),
-        strings.TrimSpace(req.Body),
-        paymentHash,
-        now,
-    )
+		messageID,
+		req.FormID,
+		strings.TrimSpace(req.SenderName),
+		strings.TrimSpace(req.SenderEmail),
+		strings.TrimSpace(req.Body),
+		paymentHash,
+		now,
+	)
 
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
-    _, err = tx.Exec(`
+	_, err = tx.Exec(`
         INSERT INTO invoices (
             id,
             message_id,
@@ -454,50 +543,50 @@ println(s.BlinkWalletID)
         )
         VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, ?)
     `,
-        invoiceID,
-        messageID,
-        form.AmountSats,
-        paymentRequest,
-        paymentHash,
-        now,
-        expiresAt,
-    )
+		invoiceID,
+		messageID,
+		form.AmountSats,
+		paymentRequest,
+		paymentHash,
+		now,
+		expiresAt,
+	)
 
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
-    if err := tx.Commit(); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-        return
-    }
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
-    log.Printf(
-        "Blink invoice created: invoice_id=%s amount=%d payment_hash=%s",
-        invoiceID,
-        form.AmountSats,
-        paymentHash,
-    )
+	log.Printf(
+		"Blink invoice created: invoice_id=%s amount=%d payment_hash=%s",
+		invoiceID,
+		form.AmountSats,
+		paymentHash,
+	)
 
-    c.JSON(http.StatusOK, InvoiceResponse{
-        InvoiceID:      invoiceID,
-        MessageID:      messageID,
-        PaymentRequest: paymentRequest,
-        AmountSats:     form.AmountSats,
-        Status:         "pending",
-        ExpiresAt:      expiresAt,
-    })
+	c.JSON(http.StatusOK, InvoiceResponse{
+		InvoiceID:      invoiceID,
+		MessageID:      messageID,
+		PaymentRequest: paymentRequest,
+		AmountSats:     form.AmountSats,
+		Status:         "pending",
+		ExpiresAt:      expiresAt,
+	})
 }
 func createBlinkInvoice(
-    apiKey string,
-    walletID string,
-    amountSats int64,
-    memo string,
+	apiKey string,
+	walletID string,
+	amountSats int64,
+	memo string,
 ) (*blinkInvoiceResult, error) {
 
-    payload := map[string]any{
-        "query": `
+	payload := map[string]any{
+		"query": `
             mutation LnInvoiceCreate($input: LnInvoiceCreateInput!) {
                 lnInvoiceCreate(input: $input) {
                     invoice {
@@ -510,77 +599,77 @@ func createBlinkInvoice(
                 }
             }
         `,
-        "variables": map[string]any{
-            "input": map[string]any{
-                "walletId": walletID,
-                "amount":   amountSats,
-                "memo":     memo,
-            },
-        },
-    }
+		"variables": map[string]any{
+			"input": map[string]any{
+				"walletId": walletID,
+				"amount":   amountSats,
+				"memo":     memo,
+			},
+		},
+	}
 
-    body, err := json.Marshal(payload)
-    if err != nil {
-        return nil, err
-    }
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
 
-    req, err := http.NewRequest(
-        http.MethodPost,
-        "https://api.blink.sv/graphql",
-        bytes.NewReader(body),
-    )
-    if err != nil {
-        return nil, err
-    }
+	req, err := http.NewRequest(
+		http.MethodPost,
+		"https://api.blink.sv/graphql",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, err
+	}
 
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("X-API-KEY", apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-KEY", apiKey)
 
-    resp, err := http.DefaultClient.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 
-    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-        return nil, fmt.Errorf("blink returned HTTP %s", resp.Status)
-    }
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("blink returned HTTP %s", resp.Status)
+	}
 
-    var result struct {
-        Data struct {
-            LnInvoiceCreate struct {
-                Invoice struct {
-                    PaymentRequest string `json:"paymentRequest"`
-                    PaymentHash    string `json:"paymentHash"`
-                } `json:"invoice"`
-                Errors []struct {
-                    Message string `json:"message"`
-                } `json:"errors"`
-            } `json:"lnInvoiceCreate"`
-        } `json:"data"`
-    }
+	var result struct {
+		Data struct {
+			LnInvoiceCreate struct {
+				Invoice struct {
+					PaymentRequest string `json:"paymentRequest"`
+					PaymentHash    string `json:"paymentHash"`
+				} `json:"invoice"`
+				Errors []struct {
+					Message string `json:"message"`
+				} `json:"errors"`
+			} `json:"lnInvoiceCreate"`
+		} `json:"data"`
+	}
 
-    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-        return nil, err
-    }
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
 
-    invoice := result.Data.LnInvoiceCreate.Invoice
+	invoice := result.Data.LnInvoiceCreate.Invoice
 
-    if len(result.Data.LnInvoiceCreate.Errors) > 0 {
-        return nil, fmt.Errorf(
-            "blink error: %s",
-            result.Data.LnInvoiceCreate.Errors[0].Message,
-        )
-    }
+	if len(result.Data.LnInvoiceCreate.Errors) > 0 {
+		return nil, fmt.Errorf(
+			"blink error: %s",
+			result.Data.LnInvoiceCreate.Errors[0].Message,
+		)
+	}
 
-    if invoice.PaymentRequest == "" {
-        return nil, fmt.Errorf("blink returned empty invoice")
-    }
+	if invoice.PaymentRequest == "" {
+		return nil, fmt.Errorf("blink returned empty invoice")
+	}
 
-    return &blinkInvoiceResult{
-        PaymentRequest: invoice.PaymentRequest,
-        PaymentHash:    invoice.PaymentHash,
-    }, nil
+	return &blinkInvoiceResult{
+		PaymentRequest: invoice.PaymentRequest,
+		PaymentHash:    invoice.PaymentHash,
+	}, nil
 }
 
 func (s *AppState) getInvoice(c *gin.Context) {
@@ -679,26 +768,40 @@ func (s *AppState) lightningWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-func (s *AppState) findForm(id string) (*Form, error) {
-	    log.Printf("FIND FORM: looking for id=%q", id)
+func (s *AppState) findForm(id, ownerID string) (*Form, error) {
+	log.Printf("FIND FORM: looking for id=%q", id)
 
+	var f Form
+	err := s.DB.QueryRow(
+		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ? AND owner_id = ?",
+		id, ownerID,
+	).Scan(&f.ID, &f.Name, &f.Domain, &f.AmountSats, &f.CreatedAt)
+	if err != nil {
+		log.Printf("FIND FORM: query failed: %v", err)
+
+		return nil, err
+	}
+
+	log.Printf("FIND FORM: found %+v", f)
+
+	log.Printf("FIND FORM: found id=%q name=%q amount=%d",
+		f.ID,
+		f.Name,
+		f.AmountSats,
+	)
+
+	return &f, nil
+}
+
+// findPublicForm retrieves a form by ID for public invoice creation.
+func (s *AppState) findPublicForm(id string) (*Form, error) {
 	var f Form
 	err := s.DB.QueryRow(
 		"SELECT id, name, domain, amount_sats, created_at FROM forms WHERE id = ?", id,
 	).Scan(&f.ID, &f.Name, &f.Domain, &f.AmountSats, &f.CreatedAt)
 	if err != nil {
-		        log.Printf("FIND FORM: query failed: %v", err)
-
 		return nil, err
 	}
-
-	    log.Printf("FIND FORM: found %+v", f)
-
-		 log.Printf("FIND FORM: found id=%q name=%q amount=%d",
-        f.ID,
-        f.Name,
-        f.AmountSats,
-    )
 
 	return &f, nil
 }
@@ -768,10 +871,6 @@ func validateMessagePayload(req CreateInvoiceRequest) error {
 	return nil
 }
 
-func buildDemoInvoice(invoiceID string, amountSats int64) string {
-	return fmt.Sprintf("satgate-demo-invoice:%s:%d", invoiceID, amountSats)
-}
-
 func verifySignature(headers http.Header, body, secret string) error {
 	sig := headers.Get("x-satgate-signature")
 	if sig == "" {
@@ -782,7 +881,7 @@ func verifySignature(headers http.Header, body, secret string) error {
 	mac.Write([]byte(body))
 	expected := hex.EncodeToString(mac.Sum(nil))
 
-	if expected != sig {
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(sig)) != 1 {
 		return fmt.Errorf("signature mismatch")
 	}
 	return nil
@@ -799,6 +898,7 @@ func runMigrations(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS forms (
 			id          TEXT PRIMARY KEY,
+			owner_id    TEXT,
 			name        TEXT NOT NULL,
 			domain      TEXT NOT NULL,
 			amount_sats INTEGER NOT NULL,
@@ -837,6 +937,66 @@ func runMigrations(db *sql.DB) error {
 			created_at DATETIME NOT NULL
 		);
 	`)
+	if err != nil {
+		return err
+	}
+
+	// Upgrade existing databases without destroying existing data.
+	rows, err := db.Query("PRAGMA table_info(forms)")
+	if err != nil {
+		return err
+	}
+
+	hasOwnerID := false
+
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+
+		if err := rows.Scan(
+			&cid,
+			&name,
+			&columnType,
+			&notNull,
+			&defaultValue,
+			&primaryKey,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+
+		if name == "owner_id" {
+			hasOwnerID = true
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	if !hasOwnerID {
+		if _, err := db.Exec("ALTER TABLE forms ADD COLUMN owner_id TEXT"); err != nil {
+			return err
+		}
+	}
+
+	// Preserve ownership of the existing development demo form.
+	if _, err := db.Exec(
+		"UPDATE forms SET owner_id = ? WHERE id = ? AND owner_id IS NULL",
+		"demo-user",
+		"demo-form",
+	); err != nil {
+		return err
+	}
+
+	_, err = db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_forms_owner_id
+		ON forms(owner_id)
+	`)
+
 	return err
 }
 
@@ -847,8 +1007,8 @@ func seedDefaultForm(db *sql.DB) error {
 		return nil
 	}
 	_, err := db.Exec(
-		"INSERT INTO forms (id, name, domain, amount_sats, created_at) VALUES (?, ?, ?, ?, ?)",
-		"demo-form", "Sarah's Portfolio", "localhost", 5, time.Now().UTC(),
+		"INSERT INTO forms (id, owner_id, name, domain, amount_sats, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		"demo-form", "demo-user", "Sarah's Portfolio", "localhost", 5, time.Now().UTC(),
 	)
 	return err
 }

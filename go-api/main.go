@@ -1,17 +1,11 @@
 package main
 
 import (
-	"context"
 	"database/sql"
-	"embed"
-	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
-	"time"
 
-	"github.com/pressly/goose/v3"
 	_ "github.com/lib/pq"
 )
 
@@ -26,44 +20,43 @@ const (
 )
 
 func main() {
-	if err := run(); err != nil {
-		log.Printf("go-api: %v", err)
-		os.Exit(1)
-	}
-}
-
-func run() error {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
-		return errors.New("DATABASE_URL must be set")
+		databaseURL = "postgres://postgres:postgres@localhost:5432/satgo?sslmode=disable"
 	}
 
 	db, err := sql.Open("postgres", databaseURL)
 	if err != nil {
-		return fmt.Errorf("open database: %w", err)
+		log.Fatal(err)
 	}
 	defer db.Close()
 
-	db.SetMaxOpenConns(maxOpenConnections)
-	db.SetMaxIdleConns(maxIdleConnections)
-	db.SetConnMaxLifetime(connectionMaxLifetime)
-
-	ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
-	defer cancel()
-
-	if err := db.PingContext(ctx); err != nil {
-		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
 	}
+	fmt.Println("Connected to PostgreSQL database")
 
-	if err := goose.SetDialect("postgres"); err != nil {
-		return fmt.Errorf("configure migrations: %w", err)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS forms (
+		id VARCHAR(255) PRIMARY KEY,
+		title VARCHAR(255) NOT NULL,
+		content TEXT NOT NULL,
+		created_at VARCHAR(255) NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal(err)
 	}
-	goose.SetBaseFS(migrationFiles)
-	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
-		return fmt.Errorf("run database migrations: %w", err)
-	}
+	fmt.Println("Created forms table")
 
-	log.Print("PostgreSQL connection ready; migrations applied")
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS messages (
+		id VARCHAR(255) PRIMARY KEY,
+		form_id VARCHAR(255) NOT NULL,
+		content TEXT NOT NULL,
+		created_at VARCHAR(255) NOT NULL
+	)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("Created messages table")
 
 	// Health endpoint used as a smoke test by deployments and load balancers.
 	mux := http.NewServeMux()

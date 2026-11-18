@@ -2,11 +2,24 @@ package main
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
+)
+
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
+
+const (
+	connectionTimeout     = 10 * time.Second
+	maxOpenConnections    = 25
+	maxIdleConnections    = 5
+	connectionMaxLifetime = 5 * time.Minute
 )
 
 func main() {
@@ -48,31 +61,25 @@ func main() {
 	}
 	fmt.Println("Created messages table")
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS invoices (
-		payment_hash VARCHAR(255) PRIMARY KEY,
-		payment_request TEXT NOT NULL,
-		site_id VARCHAR(255) NOT NULL,
-		message TEXT NOT NULL,
-		amount_sats BIGINT NOT NULL,
-		created_at VARCHAR(255) NOT NULL,
-		expires_at VARCHAR(255) NOT NULL
-	)`)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Created invoices table")
+	// Health endpoint used as a smoke test by deployments and load balancers.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealth)
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS webhook_events (
-		id VARCHAR(255) PRIMARY KEY,
-		event_type VARCHAR(255) NOT NULL,
-		status VARCHAR(50) NOT NULL,
-		created_at VARCHAR(255) NOT NULL,
-		processed_at VARCHAR(255)
-	)`)
-	if err != nil {
-		log.Fatal(err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-	fmt.Println("Created webhook_events table")
+	addr := fmt.Sprintf(":%s", port)
+	log.Printf("go-api: listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("start http server: %v", err)
+	}
+}
 
-	fmt.Println("All tables created successfully with PostgreSQL (lib/pq)")
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := fmt.Fprint(w, `{"status":"ok"}`); err != nil {
+		log.Printf("go-api: write health response: %v", err)
+	}
 }

@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15
+    container_name: satgate-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: satgate
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: go-api/Dockerfile
+    container_name: satgate-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/satgate?sslmode=disable
+      PORT: 8080
+      RUST_LOG: info
+      JWT_SECRET: satgate-jwt-secret
+      LIGHTNING_WEBHOOK_SECRET: satgate-webhook-secret
+      MAVAPAY_API_KEY: mock
+      MAVAPAY_BASE_URL: https://api.getalby.com
+    ports:
+      - "8080:8080"
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: satgate-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8080
+      NEXT_PUBLIC_LN_MODE: mock
+    ports:
+      - "3000:3000"
+
+volumes:
+  pg_data:

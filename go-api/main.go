@@ -19,11 +19,10 @@ import (
 var migrationFiles embed.FS
 
 const (
-	connectionTimeout   = 10 * time.Second
-	maxOpenConnections  = 25
-	maxIdleConnections  = 5
+	connectionTimeout     = 10 * time.Second
+	maxOpenConnections    = 25
+	maxIdleConnections    = 5
 	connectionMaxLifetime = 5 * time.Minute
-	httpHost            = "0.0.0.0:8080"
 )
 
 func main() {
@@ -66,16 +65,26 @@ func run() error {
 
 	log.Print("PostgreSQL connection ready; migrations applied")
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
+	// Health endpoint used as a smoke test by deployments and load balancers.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealth)
 
-	srv := &http.Server{Addr: httpHost}
-	go func() {
-		log.Fatalf("listen: %s\n", srv.ListenAndServe())
-	}()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := fmt.Sprintf(":%s", port)
+	log.Printf("go-api: listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		return fmt.Errorf("start http server: %w", err)
+	}
+	return nil
+}
 
-	log.Printf("HTTP health check server listening on %s", httpHost)
-	select {}
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := fmt.Fprint(w, `{"status":"ok"}`); err != nil {
+		log.Printf("go-api: write health response: %v", err)
+	}
 }

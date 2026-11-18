@@ -2,9 +2,12 @@ package main
 
 import (
 	"database/sql"
+	"embed"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
 )
@@ -69,9 +72,8 @@ func main() {
 	addr := fmt.Sprintf(":%s", port)
 	log.Printf("go-api: listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
-		return fmt.Errorf("start http server: %w", err)
+		log.Fatalf("start http server: %v", err)
 	}
-	return nil
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {

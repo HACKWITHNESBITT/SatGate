@@ -1,4 +1,5 @@
 services:
+  # Local development only: these credentials are intentionally non-production.
   db:
     image: postgres:15-alpine
     restart: unless-stopped
@@ -9,7 +10,7 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d satgo"]
       interval: 5s
@@ -28,7 +29,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@db:5432/satgo?sslmode=disable
       PORT: "8080"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 30s
@@ -42,6 +43,7 @@ services:
       context: .
       dockerfile: apps/web/Dockerfile
       args:
+        # NEXT_PUBLIC_* values are embedded at build time and used by browser code.
         NEXT_PUBLIC_API_URL: http://localhost:8080
         NEXT_PUBLIC_LN_MODE: mock
     restart: unless-stopped
@@ -52,7 +54,7 @@ services:
       NEXT_PUBLIC_API_URL: http://localhost:8080
       NEXT_PUBLIC_LN_MODE: mock
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     networks:
       - satgo-network
 
